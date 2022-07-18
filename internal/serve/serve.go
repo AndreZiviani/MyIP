@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -16,19 +17,26 @@ type geoIPHandler struct {
 	asnDB      *geoip2.Reader
 	remoteAddr net.IP
 	family     string
+	password   string
 }
 
-func (h geoIPHandler) getRemoteAddr(r *http.Request) {
-	var remoteAddr string
+type response struct {
+	IP        net.IP
+	City      string
+	ASN       string
+	Latitude  float64
+	Longitude float64
+}
+
+func (h *geoIPHandler) getRemoteAddr(r *http.Request) {
 
 	forwarded := r.Header.Get("X-Forwarded-For")
-	if forwarded == "" {
-		remoteAddr = strings.Split(forwarded, ", ")[0]
+	if forwarded != "" {
+		h.remoteAddr = net.ParseIP(strings.Split(forwarded, ", ")[0])
 	} else {
-		remoteAddr = r.RemoteAddr
+		h.remoteAddr = net.ParseIP(r.RemoteAddr)
 	}
 
-	h.remoteAddr = net.ParseIP(remoteAddr)
 	if h.remoteAddr.To4() != nil {
 		h.family = "v4"
 	} else {
@@ -38,23 +46,46 @@ func (h geoIPHandler) getRemoteAddr(r *http.Request) {
 
 func (h geoIPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
-	getRemoteAddr(r)
-	fmt.Println(r.Header)
-	remoteAddr := strings.Split(r.RemoteAddr, ":")[0]
+	h.getRemoteAddr(r)
 
-	recordCity, err := h.cityDB.City(ip)
-	recordASN, err := h.asnDB.ASN(ip)
+	if len(h.password) > 0 {
+		r.ParseForm()
+		if password, ok := r.Form["p"]; ok {
+			if password[0] != h.password {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+	}
+
+	recordCity, err := h.cityDB.City(h.remoteAddr)
+	recordASN, err := h.asnDB.ASN(h.remoteAddr)
 
 	if err != nil {
 		fmt.Println(err)
 	}
 
 	city := fmt.Sprintf("%s - %s", recordCity.City.Names["pt-BR"], recordCity.Country.Names["pt-BR"])
+	lat := recordCity.Location.Latitude
+	lon := recordCity.Location.Longitude
 	asn := fmt.Sprintf("%s (%d)", recordASN.AutonomousSystemOrganization, recordASN.AutonomousSystemNumber)
-	fmt.Println(recordASN)
-	out := fmt.Sprintf("IP: %s\n"+"City: %s\n"+"ASN: %s\n", ip, city, asn)
+	out := response{
+		IP:        h.remoteAddr,
+		City:      city,
+		ASN:       asn,
+		Latitude:  lat,
+		Longitude: lon,
+	}
+	j, err := json.Marshal(out)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
-	w.Write([]byte(out))
+	w.Write(j)
 }
 
 func openGeoIPDB(path string) (*geoip2.Reader, error) {
@@ -62,6 +93,12 @@ func openGeoIPDB(path string) (*geoip2.Reader, error) {
 }
 
 func (p *ServeCommand) Execute(args []string) error {
+	if len(p.CityPath) == 0 {
+		return fmt.Errorf("Please specify GetLite2 City mmdb file path")
+	}
+	if len(p.ASNPath) == 0 {
+		return fmt.Errorf("Please specify GetLite2 ASN mmdb file path")
+	}
 	cityDB, err := openGeoIPDB(p.CityPath)
 	asnDB, err := openGeoIPDB(p.ASNPath)
 	if err != nil {
@@ -71,11 +108,13 @@ func (p *ServeCommand) Execute(args []string) error {
 	h := geoIPHandler{}
 	h.cityDB = cityDB
 	h.asnDB = asnDB
+	h.password = p.Password
 
 	r := mux.NewRouter()
 
 	r.PathPrefix("/").Handler(h)
 
+	fmt.Printf("Listening on %s\n", p.Listen)
 	log.Fatal(http.ListenAndServe(p.Listen, r))
 	return nil
 }
